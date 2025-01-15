@@ -23,12 +23,13 @@ app.use(bodyParser.json());
 
 const verifyToken = (req, res, next) => {
   const token = req.cookies.token;
+  console.log(token);
   if (!token) {
     return res.status(403).json({ message: "Access denied" });
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET); // Token verify করা
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
 
     next();
@@ -203,6 +204,68 @@ app.get("/manage-packages", (req, res) => {
   });
 });
 
+app.get("/packages/:id", (req, res) => {
+  const { id } = req.params;
+
+  const sql = `
+    SELECT * FROM packages WHERE id = ?
+  `;
+
+  db.query(sql, [id], (err, result) => {
+    if (err) {
+      console.error("Error fetching package:", err);
+      return res.status(500).send("Error fetching package");
+    }
+
+    if (result.length === 0) {
+      return res.status(404).send("Package not found");
+    }
+
+    res.status(200).json(result[0]);
+  });
+});
+
+// Fetch bookings for a specific user
+app.get("/get-user-bookings", async (req, res) => {
+  const token = req.cookies.token; // Get the token from HTTP-only cookie
+
+  if (!token) {
+    return res.status(401).json({ error: "No token found" });
+  }
+
+  try {
+    // Decode the token to get the CID (User ID)
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const CID = decoded.id;
+
+    // Fetch bookings for the specific user (CID)
+    const query = `
+      SELECT b.booking_id, p.name AS package_name, b.travellers, b.total_cost, b.booking_date
+      FROM bookings b
+      JOIN packages p ON b.package_id = p.id
+      WHERE b.CID = ?
+      ORDER BY b.booking_date DESC
+    `;
+
+    db.query(query, [CID], (err, result) => {
+      if (err) {
+        console.error("Error fetching bookings:", err);
+        return res.status(500).send("Error fetching bookings");
+      }
+
+      if (result.length === 0) {
+        return res.status(404).send("No bookings found for this user");
+      }
+      console.log(result);
+
+      res.status(200).json({ bookings: result }); // Send the result as JSON
+    });
+  } catch (error) {
+    console.error("Error fetching bookings:", error);
+    res.status(500).json({ error: "Failed to fetch bookings" });
+  }
+});
+
 app.post("/register", (req, res) => {
   const {
     first_name,
@@ -283,6 +346,7 @@ app.post("/login", (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: "1h" } // Token validity
     );
+    console.log(token);
 
     // Set token in HTTP-only cookie
     res.cookie("token", token, {
@@ -429,25 +493,246 @@ app.post("/calculate-discount", (req, res) => {
   });
 });
 
-app.get("/packages/:id", (req, res) => {
-  const { id } = req.params;
+app.post("/packages", (req, res) => {
+  const {
+    imageUrl,
+    name,
+    startLocation,
+    tripPlace,
+    price,
+    duration,
+    hotelType,
+    foodIncluded,
+    tourGuide,
+    transportType,
+    startDate,
+    endDate,
+    description,
+    category_id, // Added category_id here
+  } = req.body;
+
+  // Debugging: Log incoming request body to check if data is correctly sent from frontend
+  console.log("Received package data:", req.body);
 
   const sql = `
-    SELECT * FROM packages WHERE id = ?
+    INSERT INTO packages
+      (imageUrl, name, startLocation, tripPlace, price, duration, hotelType, foodIncluded, tourGuide, transportType, startDate, endDate, description, category_id)
+    VALUES
+      (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `;
 
-  db.query(sql, [id], (err, result) => {
+  // Convert boolean values to "Yes"/"No" for foodIncluded and tourGuide
+  const values = [
+    imageUrl,
+    name,
+    startLocation,
+    tripPlace,
+    price,
+    duration,
+    hotelType,
+    foodIncluded ? "Yes" : "No",
+    tourGuide ? "Yes" : "No",
+    transportType,
+    startDate,
+    endDate,
+    description,
+    category_id, // Added category_id to the values array
+  ];
+
+  // Debugging: Log the SQL query and the values to check before executing
+  console.log("SQL Query:", sql);
+  console.log("SQL Values:", values);
+
+  // Execute SQL query
+  db.query(sql, values, (err, result) => {
     if (err) {
-      console.error("Error fetching package:", err);
-      return res.status(500).send("Error fetching package");
+      // Debugging: Log error message from the query execution
+      console.error("Error executing query:", err);
+      return res.status(500).send("Error adding package");
     }
 
-    if (result.length === 0) {
-      return res.status(404).send("Package not found");
-    }
-
-    res.status(200).json(result[0]);
+    // Debugging: Log success message
+    console.log("Package added successfully, ID:", result.insertId);
+    res.status(201).send("Package added successfully");
   });
+});
+
+// Handle booking confirmation
+app.post("/book-package", async (req, res) => {
+  const { packageId, customPackageId, travellers, finalCost, packageName } =
+    req.body;
+
+  const token = req.cookies.token; // Get the token from HTTP-only cookie
+  console.log("token: ", token);
+
+  if (!token) {
+    return res.status(401).json({ error: "No token found" });
+  }
+
+  if (!packageId && !customPackageId) {
+    return res
+      .status(400)
+      .json({ error: "Either packageId or customPackageId is required" });
+  }
+
+  console.log("Received data:", {
+    packageId,
+    customPackageId,
+    travellers,
+    finalCost,
+    packageName,
+  });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    console.log(decoded);
+    const CID = decoded.id;
+    console.log("CID:", CID);
+    const query = `
+      INSERT INTO bookings (
+        CID, package_id, custom_package_id, travellers, total_cost, package_name, booking_date
+      )
+      VALUES (
+        ?, 
+        CASE WHEN ? IS NOT NULL THEN ? ELSE NULL END, 
+        CASE WHEN ? IS NOT NULL THEN ? ELSE NULL END, 
+        ?, ?, ?, CURRENT_TIMESTAMP
+      );
+    `;
+
+    const values = [
+      CID,
+      packageId,
+      packageId,
+      customPackageId,
+      customPackageId,
+      travellers,
+      finalCost,
+      packageName,
+    ];
+
+    db.query(query, values);
+
+    res.status(200).json({ message: "Booking confirmed successfully" });
+  } catch (error) {
+    console.error("Error booking package:", error);
+    res.status(500).json({ error: "Failed to confirm booking" });
+  }
+});
+
+app.post("/search-packages", async (req, res) => {
+  const {
+    startDate,
+    endDate,
+    minPrice,
+    maxPrice,
+    groupSize,
+    duration,
+    discountType,
+    hotelType,
+  } = req.body;
+
+  // Initialize query parts and parameters
+  let query = `
+    SELECT 
+      p.id AS package_id,
+      p.name AS package_name,
+      p.price,
+      p.startLocation,
+      p.tripPlace,
+      p.duration,
+      p.hotelType,
+      p.transportType,
+      p.imageURL,
+      p.description,
+      p.tourGuide,
+      p.foodIncluded,
+      MAX(o.discountType) AS discountType, 
+      MAX(o.discountPercentage) AS discountPercentage,
+      MAX(o.minDuration) AS minDuration,
+      MAX(o.maxDuration) AS maxDuration,
+      MAX(o.minGroupSize) AS minGroupSize,
+      MAX(o.maxGroupSize) AS maxGroupSize
+    FROM 
+      packages p
+    LEFT JOIN 
+      offers o ON p.id = o.package_id
+    WHERE 1=1
+  `;
+
+  const params = [];
+
+  // Dynamically add filters based on input
+  if (startDate) {
+    query += " AND p.startDate >= ?";
+    params.push(startDate);
+  }
+
+  if (endDate) {
+    query += " AND p.endDate <= ?";
+    params.push(endDate);
+  }
+
+  if (minPrice) {
+    query += " AND p.price >= ?";
+    params.push(minPrice);
+  }
+
+  if (maxPrice) {
+    query += " AND p.price <= ?";
+    params.push(maxPrice);
+  }
+
+  if (groupSize) {
+    query +=
+      " AND (COALESCE(o.minGroupSize, 0) <= ? AND COALESCE(o.maxGroupSize, 0) >= ?)";
+    params.push(groupSize, groupSize);
+  }
+
+  if (duration) {
+    query +=
+      " AND (COALESCE(o.minDuration, 0) <= ? AND COALESCE(o.maxDuration, 0) >= ?)";
+    params.push(duration, duration);
+  }
+
+  if (discountType) {
+    query += " AND o.discountType = ?";
+    params.push(discountType);
+  }
+
+  if (hotelType) {
+    query += " AND p.hotelType = ?";
+    params.push(hotelType);
+  }
+
+  // Add grouping, ordering, and limit
+  query += " GROUP BY p.id ORDER BY p.startDate DESC LIMIT 10";
+
+  try {
+    db.query(query, params, (err, results) => {
+      if (err) {
+        console.error("Database query error:", err);
+        return res
+          .status(500)
+          .json({ error: "Database query failed", details: err.message });
+      }
+
+      if (results.length === 0) {
+        console.log("No packages found for the provided filters.");
+        return res
+          .status(404)
+          .json({ message: "No packages found for the provided filters." });
+      }
+
+      console.log("Search successful. Found packages:", results);
+      res.status(200).json({ packages: results });
+    });
+  } catch (error) {
+    console.error("Unexpected error during package search:", error);
+    res
+      .status(500)
+      .json({ error: "Unexpected server error", details: error.message });
+  }
 });
 
 app.put("/packages/:id", (req, res) => {
@@ -543,6 +828,60 @@ app.delete("/manage-packages/:id", (req, res) => {
     }
     res.json({ message: "Package deleted successfully." });
   });
+});
+
+// Route to get all bookings
+app.get("/bookings", (req, res) => {
+  const query = "SELECT * FROM bookings";
+
+  db.query(query, (err, results) => {
+    if (err) {
+      console.error("Error fetching bookings:", err);
+      return res.status(500).json({ error: "Error fetching bookings" });
+    }
+    res.json({ bookings: results });
+  });
+});
+
+app.patch("/bookings/confirm/:bookingId", (req, res) => {
+  const { bookingId } = req.params;
+  console.log("Booking ID received:", bookingId); // Debugging the booking ID
+
+  if (!bookingId) {
+    return res.status(400).json({ error: "Booking ID is required" });
+  }
+
+  // Update booking status to 'confirmed' in the database
+  db.query(
+    "UPDATE bookings SET status = 1 WHERE booking_id = ?",
+    [bookingId],
+    (err, result) => {
+      if (err) {
+        console.error("Database error:", err); // Log the error
+        return res.status(500).json({ error: err.message });
+      }
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: "Booking not found" });
+      }
+
+      console.log("Booking confirmed:", result); // Log the result of the query
+      res.json({ message: "Booking confirmed" });
+    }
+  );
+});
+
+app.patch("/bookings/cancel/:bookingId", (req, res) => {
+  const { bookingId } = req.params;
+  // Delete the booking from the database
+  db.query(
+    "DELETE FROM bookings WHERE booking_id = ?",
+    [bookingId],
+    (err, result) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ message: "Booking canceled" });
+    }
+  );
 });
 
 // Start Server
