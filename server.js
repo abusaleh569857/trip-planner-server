@@ -4,6 +4,7 @@ const mysql = require("mysql2");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const cookieParser = require("cookie-parser");
+const cron = require("node-cron");
 
 const bodyParser = require("body-parser");
 
@@ -23,7 +24,7 @@ app.use(bodyParser.json());
 
 const verifyToken = (req, res, next) => {
   const token = req.cookies.token;
-  console.log(token);
+  console.log("verify token : ", token);
   if (!token) {
     return res.status(403).json({ message: "Access denied" });
   }
@@ -31,6 +32,7 @@ const verifyToken = (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
+    console.log(req.user);
 
     next();
   } catch (err) {
@@ -38,13 +40,15 @@ const verifyToken = (req, res, next) => {
   }
 };
 
-// Database Connection
+//Database Connection
 const db = mysql.createConnection({
   host: "localhost",
   user: "root",
   password: "",
   database: "travel_website",
 });
+
+const promiseDb = db.promise();
 
 db.connect((err) => {
   if (err) {
@@ -53,6 +57,24 @@ db.connect((err) => {
   }
   console.log("Connected to the MySQL database!");
 });
+
+// const db = mysql.createConnection({
+//   host: "localhost",
+//   user: "root",
+//   password: "",
+//   database: "travel_website",
+// });
+
+// // Wrap the connection in a promise-based API
+// const promiseDb = db.promise();
+
+// db.connect((err) => {
+//   if (err) {
+//     console.error("Error connecting to the database:", err);
+//     return;
+//   }
+//   console.log("Connected to the MySQL database!");
+// });
 
 // Home Route
 app.get("/", (req, res) => {
@@ -240,7 +262,7 @@ app.get("/get-user-bookings", async (req, res) => {
 
     // Fetch bookings for the specific user (CID)
     const query = `
-      SELECT b.booking_id, p.name AS package_name, b.travellers, b.total_cost, b.booking_date
+      SELECT b.booking_id, p.name AS package_name, b.travellers, b.total_cost, b.booking_date,b.status
       FROM bookings b
       JOIN packages p ON b.package_id = p.id
       WHERE b.CID = ?
@@ -264,6 +286,30 @@ app.get("/get-user-bookings", async (req, res) => {
     console.error("Error fetching bookings:", error);
     res.status(500).json({ error: "Failed to fetch bookings" });
   }
+});
+
+app.get("/bookings", (req, res) => {
+  // Query to order bookings by status with 'Pending' first
+  const query = `
+    SELECT * FROM bookings
+    ORDER BY 
+      CASE 
+        WHEN status = 'Pending' THEN 1
+        WHEN status = 'Confirmed' THEN 2
+        WHEN status = 'Completed' THEN 3
+        WHEN status = 'Cancelled' THEN 4
+        ELSE 5
+      END, booking_date ASC;
+  `;
+
+  db.query(query, (err, results) => {
+    if (err) {
+      console.error("Error fetching bookings:", err);
+      return res.status(500).json({ error: "Error fetching bookings" });
+    }
+    console.log(results);
+    res.json({ bookings: results });
+  });
 });
 
 app.post("/register", (req, res) => {
@@ -344,9 +390,9 @@ app.post("/login", (req, res) => {
     const token = jwt.sign(
       { id: user.CID, role: user.role, photoURL: user.photoURL }, // Include role for admin panel
       process.env.JWT_SECRET,
-      { expiresIn: "1h" } // Token validity
+      { expiresIn: "10h" } // Token validity
     );
-    console.log(token);
+    console.log("login api : ", token);
 
     // Set token in HTTP-only cookie
     res.cookie("token", token, {
@@ -830,19 +876,6 @@ app.delete("/manage-packages/:id", (req, res) => {
   });
 });
 
-// Route to get all bookings
-app.get("/bookings", (req, res) => {
-  const query = "SELECT * FROM bookings";
-
-  db.query(query, (err, results) => {
-    if (err) {
-      console.error("Error fetching bookings:", err);
-      return res.status(500).json({ error: "Error fetching bookings" });
-    }
-    res.json({ bookings: results });
-  });
-});
-
 app.patch("/bookings/confirm/:bookingId", (req, res) => {
   const { bookingId } = req.params;
   console.log("Booking ID received:", bookingId); // Debugging the booking ID
@@ -853,7 +886,7 @@ app.patch("/bookings/confirm/:bookingId", (req, res) => {
 
   // Update booking status to 'confirmed' in the database
   db.query(
-    "UPDATE bookings SET status = 1 WHERE booking_id = ?",
+    "UPDATE bookings SET status = 'Confirmed' WHERE booking_id = ?",
     [bookingId],
     (err, result) => {
       if (err) {
@@ -873,15 +906,258 @@ app.patch("/bookings/confirm/:bookingId", (req, res) => {
 
 app.patch("/bookings/cancel/:bookingId", (req, res) => {
   const { bookingId } = req.params;
-  // Delete the booking from the database
+
+  // Update the booking status to 'Cancelled' in the database
+  const query = "UPDATE bookings SET status = 'Cancelled' WHERE booking_id = ?";
+
+  db.query(query, [bookingId], (err, result) => {
+    if (err) {
+      console.error("Error updating booking status:", err);
+      return res.status(500).json({ error: "Failed to cancel booking" });
+    }
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    res.json({ message: "Booking status updated to Cancelled" });
+  });
+});
+
+//Schedule the cron job to run every day at midnight
+cron.schedule("0 0 * * *", async () => {
+  try {
+    const query = `
+      UPDATE bookings b
+      JOIN packages p ON b.package_id = p.package_id
+      SET b.status = 'Completed'
+      WHERE p.endDate < CURRENT_DATE AND b.status = 'Confirmed';
+    `;
+    db.query(query);
+    console.log("Booking statuses updated to Completed.");
+  } catch (error) {
+    console.error("Error updating booking statuses:", error);
+  }
+});
+
+// Get Completed Packages for Specific User
+
+app.get("/completed-packages", (req, res) => {
+  const token = req.cookies.token;
+  if (!token) {
+    return res.status(401).json({ error: "No token found" });
+  }
+
+  const decoded = jwt.verify(token, process.env.JWT_SECRET);
+  const CID = decoded.id;
+  console.log("CID : ", CID);
+
+  const query = `
+    SELECT 
+      b.booking_id,
+      b.travellers,
+      b.total_cost,
+      b.status,
+      b.booking_date,
+      p.id,
+      p.name,
+      p.startLocation,
+      p.tripPlace,
+      p.startDate,
+      p.endDate
+    FROM bookings b
+    INNER JOIN packages p ON b.package_id = p.id
+    WHERE b.CID = ? AND b.status = 'Completed';
+  `;
+
+  db.query(query, [CID], (err, results) => {
+    if (err) {
+      console.error("Error fetching completed packages:", err);
+      return res
+        .status(500)
+        .json({ error: "Error fetching completed packages" });
+    }
+
+    res.json({ completedPackages: results });
+  });
+});
+
+// Submit a review for a specific package
+app.post("/submit-review", (req, res) => {
+  const token = req.cookies.token;
+  if (!token) {
+    return res.status(401).json({ error: "No token found" });
+  }
+
+  const decoded = jwt.verify(token, process.env.JWT_SECRET);
+  const CID = decoded.id;
+  const { booking_id, package_id, reviewText, rating } = req.body;
+  console.log(booking_id, package_id, reviewText, rating);
+
+  const query = `
+    INSERT INTO reviews (booking_id,user_id,package_id ,review_text,ratings, created_at)
+    VALUES (?, ?, ?, ?, ?, NOW())
+  `;
+
   db.query(
-    "DELETE FROM bookings WHERE booking_id = ?",
-    [bookingId],
+    query,
+    [booking_id, CID, package_id, reviewText, rating],
     (err, result) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ message: "Booking canceled" });
+      if (err) {
+        console.error("Error submitting review:", err);
+        return res.status(500).json({ error: "Failed to submit review." });
+      }
+
+      res.json({ message: "Review submitted successfully." });
     }
   );
+});
+
+// Get All Reviews
+app.get("/reviews", (req, res) => {
+  const sql = `
+    SELECT r.review_id, r.review_text, r.ratings, 
+           p.name AS package_name, p.startLocation, p.tripPlace, 
+           u.first_name AS reviewer_name 
+    FROM reviews AS r
+    JOIN packages AS p ON r.package_id = p.id
+    JOIN users AS u ON r.user_id = u.CID;
+  `;
+
+  db.query(sql, (err, result) => {
+    if (err) {
+      console.error("Error fetching reviews:", err);
+      return res.status(500).json({ error: "Failed to fetch reviews." });
+    }
+    res.json({ reviews: result });
+  });
+});
+
+app.get("/admin-stats", async (req, res) => {
+  try {
+    const [totalUsers] = await promiseDb.query(
+      "SELECT COUNT(*) AS count FROM users"
+    );
+    const [totalPackages] = await promiseDb.query(
+      "SELECT COUNT(*) AS count FROM packages"
+    );
+    const [confirmedPackages] = await promiseDb.query(
+      "SELECT COUNT(*) AS count FROM bookings WHERE status = 'Confirmed'"
+    );
+    const [pendingPackages] = await promiseDb.query(
+      "SELECT COUNT(*) AS count FROM bookings WHERE status = 'Pending'"
+    );
+    const [completedPackages] = await promiseDb.query(
+      "SELECT COUNT(*) AS count FROM bookings WHERE status = 'Completed'"
+    );
+
+    res.json({
+      totalUsers: totalUsers[0]?.count || 0,
+      totalPackages: totalPackages[0]?.count || 0,
+      confirmedPackages: confirmedPackages[0]?.count || 0,
+      pendingPackages: pendingPackages[0]?.count || 0,
+      completedPackages: completedPackages[0]?.count || 0,
+    });
+  } catch (err) {
+    console.error("Error fetching admin stats:", err);
+    res.status(500).json({ error: "Failed to fetch admin stats" });
+  }
+});
+
+app.get("/bar-chart-stats", async (req, res) => {
+  try {
+    const [totalRevenueResult] = await promiseDb.query(
+      "SELECT SUM(total_cost) AS totalRevenue FROM bookings WHERE status = 'Completed'"
+    );
+
+    const [topDestinationsResult] = await promiseDb.query(
+      "SELECT tripPlace, COUNT(tripPlace) AS count FROM packages GROUP BY tripPlace ORDER BY count DESC LIMIT 1"
+    );
+
+    const [bookingsLast7DaysResult] = await promiseDb.query(
+      "SELECT COUNT(*) AS count FROM bookings WHERE booking_date >= CURDATE() - INTERVAL 7 DAY"
+    );
+
+    const [avgPriceResult] = await promiseDb.query(
+      "SELECT AVG(total_cost) AS avgPrice FROM bookings"
+    );
+
+    const [pendingRevenueResult] = await promiseDb.query(
+      "SELECT SUM(total_cost) AS pendingRevenue FROM bookings WHERE status = 'Pending'"
+    );
+
+    res.json({
+      totalRevenue: totalRevenueResult[0]?.totalRevenue || 0,
+      topDestinations: {
+        count: topDestinationsResult[0]?.count || 0,
+        tripPlace: topDestinationsResult[0]?.tripPlace || "N/A",
+      },
+      bookingsLast7Days: bookingsLast7DaysResult[0]?.count || 0,
+      avgPrice: avgPriceResult[0]?.avgPrice || 0,
+      pendingRevenue: pendingRevenueResult[0]?.pendingRevenue || 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch bar chart data" });
+  }
+});
+
+// API to get users and their confirmed packages
+// app.get("/admin/manage-users", async (req, res) => {
+//   const query = `
+//     SELECT
+//       u.CID AS user_id,
+//       u.first_name,
+//       u.last_name,
+//       u.email,
+//       COUNT(b.booking_id) AS confirmed_packages
+//     FROM
+//       users u
+//     LEFT JOIN
+//       bookings b
+//     ON
+//       u.CID = b.CID AND b.status = 'Confirmed'
+//     GROUP BY
+//       u.CID, u.first_name, u.last_name, u.email
+//     ORDER BY
+//       confirmed_packages DESC;
+//   `;
+
+//   db.query(query, (err, results) => {
+//     if (err) {
+//       return res.status(500).json({ error: "Failed to fetch user data" });
+//     }
+//     res.json(results);
+//   });
+// });
+
+app.get("/admin/manage-users", async (req, res) => {
+  const query = `
+    SELECT 
+      u.CID AS user_id, 
+      u.first_name, 
+      u.last_name, 
+      u.email, 
+      COUNT(CASE WHEN b.status = 'Confirmed' THEN 1 END) AS confirmed_packages,
+      COUNT(CASE WHEN b.status = 'Pending' THEN 1 END) AS pending_packages,
+      COUNT(CASE WHEN b.status = 'Completed' THEN 1 END) AS completed_packages
+    FROM 
+      users u
+    LEFT JOIN 
+      bookings b 
+    ON 
+      u.CID = b.CID
+    GROUP BY 
+      u.CID, u.first_name, u.last_name, u.email
+    ORDER BY 
+      confirmed_packages DESC;
+  `;
+
+  db.query(query, (err, results) => {
+    if (err) {
+      return res.status(500).json({ error: "Failed to fetch user data" });
+    }
+    res.json(results);
+  });
 });
 
 // Start Server
