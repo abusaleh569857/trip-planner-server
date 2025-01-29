@@ -169,6 +169,7 @@ app.get("/calculate-price/:id", (req, res) => {
     if (result.length === 0) {
       return res.status(404).json({ error: "Package not found" });
     }
+    console.log(result[0]);
     res.json(result[0]); // Return total_price
   });
 });
@@ -256,18 +257,29 @@ app.get("/get-user-bookings", async (req, res) => {
   }
 
   try {
-    // Decode the token to get the CID (User ID)
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const CID = decoded.id;
 
     // Fetch bookings for the specific user (CID)
     const query = `
-      SELECT b.booking_id, p.name AS package_name, b.travellers, b.total_cost, b.booking_date,b.status
-      FROM bookings b
-      JOIN packages p ON b.package_id = p.id
-      WHERE b.CID = ?
-      ORDER BY b.booking_date DESC
-    `;
+    SELECT 
+      booking_id, 
+      package_name, 
+      travellers, 
+      total_cost, 
+      booking_date, 
+      status
+    FROM bookings
+    WHERE CID = ?
+    ORDER BY booking_date DESC
+  `;
+    // const query = `
+    //   SELECT b.booking_id, p.name AS package_name, b.travellers, b.total_cost, b.booking_date,b.status
+    //   FROM bookings b
+    //   JOIN packages p ON b.package_id = p.id
+    //   WHERE b.CID = ?
+    //   ORDER BY b.booking_date DESC
+    // `;
 
     db.query(query, [CID], (err, result) => {
       if (err) {
@@ -666,6 +678,52 @@ app.post("/book-package", async (req, res) => {
   }
 });
 
+app.post("/api/bookings", async (req, res) => {
+  const { custom_package_id, travelers, total_cost, package_name } = req.body;
+  console.log(custom_package_id, travelers, total_cost, package_name);
+  const token = req.cookies.token;
+  console.log(token);
+
+  if (!token) {
+    return res.status(401).json({ error: "No token found" });
+  }
+
+  if (!custom_package_id) {
+    return res
+      .status(400)
+      .json({ error: "Either packageId or customPackageId is required" });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    console.log(decoded);
+    const CID = decoded.id;
+    const sql = `
+      INSERT INTO bookings (CID, custom_package_id, travellers, total_cost, package_name)
+      VALUES (?, ?, ?, ?, ?)
+    `;
+    const values = [
+      CID, // Replace with actual CID from session or authentication
+      custom_package_id,
+      travelers,
+      total_cost,
+      package_name,
+    ];
+
+    db.query(sql, values, (err, result) => {
+      if (err) {
+        console.error(err);
+        return res.status(500).json({ error: "Error saving the booking" });
+      }
+
+      res.status(200).json({ message: "Booking successfully created!" });
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "An error occurred while creating booking" });
+  }
+});
+
 app.post("/search-packages", async (req, res) => {
   const {
     startDate,
@@ -982,7 +1040,6 @@ app.get("/completed-packages", (req, res) => {
   });
 });
 
-// Submit a review for a specific package
 app.post("/submit-review", (req, res) => {
   const token = req.cookies.token;
   if (!token) {
@@ -992,31 +1049,53 @@ app.post("/submit-review", (req, res) => {
   const decoded = jwt.verify(token, process.env.JWT_SECRET);
   const CID = decoded.id;
   const { booking_id, package_id, reviewText, rating } = req.body;
-  console.log(booking_id, package_id, reviewText, rating);
 
-  const query = `
-    INSERT INTO reviews (booking_id,user_id,package_id ,review_text,ratings, created_at)
-    VALUES (?, ?, ?, ?, ?, NOW())
+  // Step 1: Check if a review already exists for the given booking and user
+  const checkQuery = `
+    SELECT * FROM reviews
+    WHERE booking_id = ? AND user_id = ?
   `;
 
-  db.query(
-    query,
-    [booking_id, CID, package_id, reviewText, rating],
-    (err, result) => {
-      if (err) {
-        console.error("Error submitting review:", err);
-        return res.status(500).json({ error: "Failed to submit review." });
-      }
-
-      res.json({ message: "Review submitted successfully." });
+  db.query(checkQuery, [booking_id, CID], (err, results) => {
+    if (err) {
+      console.error("Error checking existing reviews:", err);
+      return res
+        .status(500)
+        .json({ error: "Failed to check existing reviews." });
     }
-  );
+
+    if (results.length > 0) {
+      // A review already exists for this booking and user
+      return res.status(400).json({
+        error: "You have already submitted a review for this booking.",
+      });
+    }
+
+    // Step 2: If no review exists, proceed with inserting the new review
+    const insertQuery = `
+      INSERT INTO reviews (booking_id, user_id, package_id, review_text, ratings, created_at)
+      VALUES (?, ?, ?, ?, ?, NOW())
+    `;
+
+    db.query(
+      insertQuery,
+      [booking_id, CID, package_id, reviewText, rating],
+      (err, result) => {
+        if (err) {
+          console.error("Error submitting review:", err);
+          return res.status(500).json({ error: "Failed to submit review." });
+        }
+
+        res.json({ message: "Review submitted successfully." });
+      }
+    );
+  });
 });
 
 // Get All Reviews
 app.get("/reviews", (req, res) => {
   const sql = `
-    SELECT r.review_id, r.review_text, r.ratings, 
+    SELECT r.review_id, r.review_text, r.ratings ,r.created_at, 
            p.name AS package_name, p.startLocation, p.tripPlace, 
            u.first_name AS reviewer_name 
     FROM reviews AS r
@@ -1100,35 +1179,6 @@ app.get("/bar-chart-stats", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch bar chart data" });
   }
 });
-
-// API to get users and their confirmed packages
-// app.get("/admin/manage-users", async (req, res) => {
-//   const query = `
-//     SELECT
-//       u.CID AS user_id,
-//       u.first_name,
-//       u.last_name,
-//       u.email,
-//       COUNT(b.booking_id) AS confirmed_packages
-//     FROM
-//       users u
-//     LEFT JOIN
-//       bookings b
-//     ON
-//       u.CID = b.CID AND b.status = 'Confirmed'
-//     GROUP BY
-//       u.CID, u.first_name, u.last_name, u.email
-//     ORDER BY
-//       confirmed_packages DESC;
-//   `;
-
-//   db.query(query, (err, results) => {
-//     if (err) {
-//       return res.status(500).json({ error: "Failed to fetch user data" });
-//     }
-//     res.json(results);
-//   });
-// });
 
 app.get("/admin/manage-users", async (req, res) => {
   const query = `
